@@ -19,6 +19,11 @@ class QWatcher:
                     self.p_to_clauses[abs(lit)].append(c)
     
     def is_consistent(self, p_assignment, processed_vars):
+        """
+        p_assignment: dict {var_id: bool}
+        processed_vars: список переменных P, уже обработанных
+        Проверяет 2-SAT выполнимость Q при заданных P.
+        """
         adj = defaultdict(list)
         
         for c in self.bridge_clauses:
@@ -29,23 +34,39 @@ class QWatcher:
             future_p = [l for l in p_lits if abs(l) not in processed_vars]
             
             if future_p:
-                continue # Клоз "живой", он может быть удовлетворен в будущем. Игнорируем его.
-                
-            # 2. Если все P-переменные клоза уже обработаны:
-            is_satisfied_by_p = any(p_assignment.get(abs(l)) == (l > 0) for l in p_lits)
+                continue  # Клоз "живой", он может быть удовлетворен в будущем. Игнорируем его.
             
-            if is_satisfied_by_p:
-                continue # Клоз уже True, он не давит на Q.
-                
+            # 2. Если все P-переменные клоза уже обработаны:
+            # Проверяем, все ли они False
+            all_p_false = True
+            for l in p_lits:
+                var = abs(l)
+                # Если переменная есть в assignment и её значение совпадает с литералом (True для положительного)
+                if var in p_assignment:
+                    if (l > 0 and p_assignment[var]) or (l < 0 and not p_assignment[var]):
+                        all_p_false = False
+                        break
+                else:
+                    # Переменная обработана, но её нет в assignment? Странно, но на всякий случай
+                    all_p_false = False
+                    break
+            
+            if not all_p_false:
+                continue  # Клоз уже True за счёт P, он не давит на Q
+            
             # 3. А вот теперь это ЖЕСТКОЕ ограничение на Q
             if len(q_lits) == 1:
+                # Unit Clause: (q1) -> добавляем ребро (-q1 -> q1)
                 q = q_lits[0]
                 adj[-q].append(q)
             elif len(q_lits) == 2:
+                # 2-SAT Clause: (q1 or q2) -> (-q1 -> q2, -q2 -> q1)
                 q1, q2 = q_lits
                 adj[-q1].append(q2)
                 adj[-q2].append(q1)
-
+            # Случай len(q_lits) == 3 невозможен, т.к. Q - независимое множество
+        
+        # 2. Алгоритм Тарьяна для поиска SCC
         return self._has_no_conflicts(adj)
     
     def _has_no_conflicts(self, adj):
@@ -97,7 +118,7 @@ class SlidingWindowSolver:
         self.Q = []
         self.clauses = []
         self.n = 0
-        self.window_size = 42  # уменьшили с 10 до 8
+        self.window_size = 10  # уменьшили окно до 20
         self.peak_size = 0
         self.peak_memory = 0
         tracemalloc.start()
@@ -228,10 +249,7 @@ class SlidingWindowSolver:
         print(f"Топ-5 P по связности: {self.P[:5]}")
         
         # Собираем все мостовые клозы для QWatcher
-        all_bridge_clauses = []
-        for i in range(1, len(self.P) + 1):
-            bridge = self._get_bridge_clauses(self.P[:i], Q, clauses)
-            all_bridge_clauses.extend(bridge)
+        all_bridge_clauses = self._get_bridge_clauses(self.P, Q, clauses)
         
         # Убираем дубликаты
         unique_bridge = []
@@ -255,18 +273,23 @@ class SlidingWindowSolver:
             
             print(f"\n🪟 Окно {i//self.window_size + 1}: {window}")
             
-            # Добавляем клозы внутри окна
+            # Добавляем клозы внутри окна (уже все накопленные processed_vars)
             window_clauses = self._get_clauses_for_vars(processed_vars, clauses)
             for clause in window_clauses:
                 current_p_bdd &= self._clause_to_bdd(clause)
             
-            # 🔥 ФИЛЬТРАЦИЯ ЧЕРЕЗ QWATCHER
+            # 🔥 ФИЛЬТРАЦИЯ ЧЕРЕЗ QWATCHER (пока отключена из-за рекурсии)
             if q_watcher and current_p_bdd != self.bdd.true:
-                current_p_bdd = self._filter_bdd_via_qwatcher(
-                    current_p_bdd, 
-                    q_watcher, 
-                    processed_vars
-                )
+                # Строим bridge_bdd из мостовых клозов
+                bridge_bdd = self.bdd.true
+                current_bridge = self._get_bridge_clauses(processed_vars, Q, clauses)
+                for clause in current_bridge:
+                    bridge_bdd &= self._clause_to_bdd(clause)
+                
+                # Элиминируем Q
+                q_vars = [f'x{q}' for q in Q]
+                exists_q = self.bdd.exist(q_vars, bridge_bdd)
+                current_p_bdd &= exists_q
             
             # Мониторинг
             size = len(self.bdd)
@@ -335,12 +358,14 @@ def find_vertex_cover(clauses, n):
             if max_vertex in edge:
                 to_remove.append(edge)
                 a, b = edge
-                degree[a] = max(0, degree[a] - 1)
-                degree[b] = max(0, degree[b] - 1)
-                if degree[a] == 0:
-                    del degree[a]
-                if degree[b] == 0:
-                    del degree[b]
+                if a in degree:
+                    degree[a] = max(0, degree[a] - 1)
+                    if degree[a] == 0:
+                        del degree[a]
+                if b in degree:
+                    degree[b] = max(0, degree[b] - 1)
+                    if degree[b] == 0:
+                        del degree[b]
         for edge in to_remove:
             uncovered.remove(edge)
     
