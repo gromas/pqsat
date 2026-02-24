@@ -1,3 +1,6 @@
+# ALL-SAT SOLVER
+# CREATES BDD FOR ALL P variables without combinatorial explosion
+# ALL Q calculates from CUBE(P) like 2-CNF from |Q|
 from dd.autoref import BDD
 import gc
 import sys
