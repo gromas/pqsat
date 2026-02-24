@@ -143,6 +143,9 @@ class MatryoshkaSolver:
         for i in range(1, n+1):
             self.bdd.declare(f'x{i}')
         
+        # Включаем автоматическое переупорядочивание (совет Gemini)
+        self.bdd.configure(reordering=True)
+        
         # Шаг 1: Строим матрешку
         levels = self._build_matryoshka()
         
@@ -190,14 +193,13 @@ class MatryoshkaSolver:
                 q_vars = [f'x{q}' for q in level['Q']]
                 print(f"  Схлопываем Q: {len(level['Q'])} переменных")
                 current_bdd = self.bdd.exist(q_vars, current_bdd)
-            
-            # Схлопываем Q И "вышедшие из чата" P (которые больше не нужны)
-            #dead_vars = set(prev_level['P']) - set(level['P'])  # переменные, которые были в P, но ушли
-            #all_dead = dead_vars | set(level['Q'])
-
-            #if all_dead:
-            #    dead_var_names = [f'x{v}' for v in all_dead]
-            #    current_bdd = self.bdd.exist(dead_var_names, current_bdd)
+                
+                # 🧹 Сборка мусора (совет Gemini)
+                self.bdd.collect_garbage()
+                
+                # 🔄 Переупорядочивание раз в 3 уровня
+                if i % 3 == 0:
+                    self.bdd.configure(reordering=True)
             
             self.peak_size = max(self.peak_size, len(self.bdd))
             self._print_memory(f"после уровня {i}")
