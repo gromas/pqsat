@@ -4,15 +4,18 @@ import sys
 import os
 import time
 import tracemalloc
-from collections import defaultdict
+from collections import defaultdict, Counter
 from dimacs_loader import parse_dimacs_cnf
 
 class MatryoshkaLite:
     def __init__(self):
-        self.main_bdd = None
+        self.bdd = None
         self.clauses = []
         self.n = 0
-        self.levels = []
+        self.last_seen = {}
+        self.first_seen = {}
+        self.var_lifetime = {}
+        self.var_frequency = Counter()  # Частота появления переменных
         self.peak_memory = 0
         self.start_time = None
         tracemalloc.start()
@@ -23,179 +26,244 @@ class MatryoshkaLite:
         elapsed = time.time() - self.start_time
         print(f"  ⏱️ {elapsed:.1f}s | 💾 {current/1024/1024:.1f} MB | {label}")
     
-    def _find_vertex_cover_for_subset(self, var_subset):
-        if len(var_subset) <= 1:
-            return [], list(var_subset)
+    def _build_dependency_map(self):
+        """Строит карты первого и последнего вхождения для каждой переменной"""
+        self.first_seen = {}
+        self.last_seen = {}
+        self.var_frequency = Counter()
         
-        var_set = set(var_subset)
-        edges = set()
-        for clause in self.clauses:
-            vars_in = [abs(lit) for lit in clause if abs(lit) in var_set]
-            if len(vars_in) < 2:
-                continue
-            for i in range(len(vars_in)):
-                for j in range(i+1, len(vars_in)):
-                    a, b = sorted([vars_in[i], vars_in[j]])
-                    edges.add((a, b))
+        for i, clause in enumerate(self.clauses):
+            for lit in clause:
+                var = abs(lit)
+                self.var_frequency[var] += 1
+                if var not in self.first_seen:
+                    self.first_seen[var] = i
+                self.last_seen[var] = i
         
-        if not edges:
-            return [], list(var_subset)
+        # Вычисляем длительность жизни
+        self.var_lifetime = {}
+        for var in self.first_seen:
+            self.var_lifetime[var] = self.last_seen[var] - self.first_seen[var]
         
-        degree = defaultdict(int)
-        for a, b in edges:
-            degree[a] += 1
-            degree[b] += 1
+        # Анализируем статистику
+        short_lived = [v for v, lt in self.var_lifetime.items() if lt < 20]
+        medium_lived = [v for v, lt in self.var_lifetime.items() if 20 <= lt <= 100]
+        long_lived = [v for v, lt in self.var_lifetime.items() if lt > 100]
         
-        cover = set()
-        uncovered = edges.copy()
-        while uncovered and degree:
-            max_v = max(degree.items(), key=lambda x: x[1])[0]
-            cover.add(max_v)
-            to_remove = []
-            for e in uncovered:
-                if max_v in e:
-                    to_remove.append(e)
-                    a, b = e
-                    degree[a] -= 1
-                    degree[b] -= 1
-                    if degree[a] == 0: del degree[a]
-                    if degree[b] == 0: del degree[b]
-            for e in to_remove:
-                uncovered.remove(e)
+        print(f"  📊 Короткоживущие (<20 клозов): {len(short_lived)}")
+        print(f"  📊 Среднеживущие (20-100): {len(medium_lived)}")
+        print(f"  📊 Долгоживущие (>100 клозов): {len(long_lived)}")
         
-        P = list(cover)
-        Q = [v for v in var_subset if v not in cover]
-        return P, Q
+        # Возвращаем информацию о типе задачи
+        if len(long_lived) > len(self.clauses) * 0.3:  # >30% переменных - долгожители
+            return "long_lived_dominant"
+        return "normal"
     
-    def _build_plan(self):
-        print("📋 Компиляция плана...")
-        current = list(range(1, self.n + 1))
-        level = 0
-        while current and level < 10:
-            P, Q = self._find_vertex_cover_for_subset(current)
-            if not P:
-                self.levels.append({'P': [], 'Q': current})
-                break
-            self.levels.append({'P': P, 'Q': Q})
-            print(f"  Уровень {level}: |P|={len(P)}, |Q|={len(Q)}")
-            current = P
-            level += 1
-        self.levels.reverse()  # теперь дно - индекс 0
-        return self.levels
+    def _smart_clause_ordering(self, problem_type):
+        """Умная сортировка клозов для минимизации активных переменных"""
+        
+        if problem_type == "long_lived_dominant":
+            print("  🔥 Обнаружена задача с доминированием долгожителей - применяем специальную стратегию")
+            return self._long_lived_strategy()
+        else:
+            return self._normal_strategy()
     
-    def _get_clauses_for(self, vars_set):
-        result = []
-        vs = set(vars_set)
-        for c in self.clauses:
-            if set(abs(lit) for lit in c).issubset(vs):
-                result.append(c)
-        return result
+    def _long_lived_strategy(self):
+        """Специальная стратегия для задач, где все переменные живут долго"""
+        
+        # Метрика: важность переменной = (частота * оставшаяся жизнь)
+        var_importance = {}
+        for var in range(1, self.n + 1):
+            if var in self.last_seen:
+                # Чем чаще встречается и чем дольше живет, тем важнее
+                var_importance[var] = self.var_frequency[var] * (self.last_seen[var] - self.first_seen[var])
+        
+        # Сортируем клозы по убыванию суммарной важности переменных
+        # Идея: сначала обрабатываем самые "связанные" клозы, чтобы BDD быстрее нашел структуру
+        clause_scores = []
+        for i, clause in enumerate(self.clauses):
+            vars_in = [abs(lit) for lit in clause]
+            
+            # Суммарная важность переменных в клозе
+            total_importance = sum(var_importance.get(v, 0) for v in vars_in)
+            
+            # Бонус за разнообразие переменных (чем больше разных, тем лучше для структуры)
+            diversity_bonus = len(set(vars_in)) * 1000
+            
+            # Штраф за очень редкие переменные (их можно отложить)
+            rarity_penalty = sum(1 for v in vars_in if self.var_frequency[v] < 5) * 500
+            
+            score = total_importance + diversity_bonus - rarity_penalty
+            clause_scores.append(( -score, i, clause))  # По убыванию
+        
+        clause_scores.sort()
+        
+        # Альтернатива: перемешиваем с приоритетом важных
+        sorted_clauses = [clause for _, _, clause in clause_scores]
+        
+        # Для долгожителей также пробуем кластеризацию по переменным
+        # Берем топ-10 самых важных переменных
+        top_vars = sorted(var_importance.items(), key=lambda x: x[1], reverse=True)[:10]
+        top_var_ids = [v for v, _ in top_vars]
+        
+        print(f"  🔑 Топ-5 важных переменных: {top_var_ids[:5]}")
+        
+        return sorted_clauses
     
-    def _clause_to_bdd(self, bdd_mgr, clause):
-        b = bdd_mgr.false
+    def _normal_strategy(self):
+        """Обычная стратегия для задач с короткоживущими переменными"""
+        clause_scores = []
+        
+        for i, clause in enumerate(self.clauses):
+            vars_in_clause = [abs(lit) for lit in clause]
+            
+            # Метрика 1: Есть ли переменная, которая умирает сразу после этого клоза?
+            dying_here = sum(1 for v in vars_in_clause if self.last_seen[v] == i)
+            
+            # Метрика 2: Средняя оставшаяся жизнь переменных в клозе
+            remaining_life = sum(self.last_seen[v] - i for v in vars_in_clause) / max(1, len(vars_in_clause))
+            
+            # Метрика 3: "Золотой" коэффициент
+            gold_score = dying_here * 100 - remaining_life
+            
+            # Метрика 4: Приоритет для короткоживущих переменных
+            short_term_bonus = sum(1 for v in vars_in_clause if self.var_lifetime[v] < 20) * 50
+            
+            total_score = gold_score + short_term_bonus
+            clause_scores.append(( -total_score, i, clause))
+        
+        clause_scores.sort()
+        return [clause for _, _, clause in clause_scores]
+    
+    def _clause_to_bdd(self, clause):
+        b = self.bdd.false
         for lit in clause:
             name = f'x{abs(lit)}'
-            lit_bdd = bdd_mgr.var(name) if lit > 0 else ~bdd_mgr.var(name)
+            if name not in self.bdd.vars:
+                self.bdd.declare(name)
+            lit_bdd = self.bdd.var(name) if lit > 0 else ~self.bdd.var(name)
             b |= lit_bdd
         return b
     
     def solve(self, clauses, n):
         self.start_time = time.time()
-        self.clauses = clauses
+        self.clauses = list(clauses)
         self.n = n
         
         print(f"\n📊 {n} переменных, {len(clauses)} клозов")
-        self._build_plan()
         
-        # Основной BDD - только для самого глубокого уровня
-        self.manager = BDD()
-        bottom_vars = self.levels[0]['P']
-        if not bottom_vars:
-            bottom_vars = self.levels[0]['Q']
-        for v in bottom_vars:
-            self.manager.declare(f'x{v}')
-        self.main_bdd = self.manager.true
+        # Строим карты зависимостей и определяем тип задачи
+        problem_type = self._build_dependency_map()
+        self._print_stats("карты зависимостей построены")
         
-        # Строим дно
-        bottom_clauses = self._get_clauses_for(bottom_vars)
-        for c in bottom_clauses:
-            self.main_bdd &= self._clause_to_bdd(self.manager, c)
-        self._print_stats("дно")
+        # Умная сортировка клозов
+        self.clauses = self._smart_clause_ordering(problem_type)
+        self._print_stats("клозы отсортированы")
         
-        # Поднимаемся по уровням
-        for i in range(1, len(self.levels)):
-            level = self.levels[i]
-            next_level = self.levels[i-1]
+        # Перестраиваем last_seen с учетом новой сортировки
+        self.last_seen = {}
+        for i, clause in enumerate(self.clauses):
+            for lit in clause:
+                self.last_seen[abs(lit)] = i
+        
+        # Инициализируем BDD
+        self.bdd = BDD()
+        
+        # Пытаемся настроить реордеринг
+        try:
+            # Для долгожителей оставляем реордеринг включенным, но с большим порогом
+            if problem_type == "long_lived_dominant":
+                self.bdd.configure(reorder=True, max_memory=1024*1024*1024)
+                print("  ✅ Реордеринг активен (необходимо для долгожителей)")
+            else:
+                self.bdd.configure(reorder=False)
+                print("  ✅ Автоматический реордеринг отключен")
+        except:
+            print("  ⚠️ Не удалось настроить реордеринг")
+        
+        current_bdd = self.bdd.true
+        eliminated_vars = set()
+        
+        # Для долгожителей делаем меньший прогрев
+        warmup = 10 if problem_type == "long_lived_dominant" else 20
+        print(f"\n🔥 Прогрев BDD (первые {warmup} клозов)...")
+        
+        # Фаза 1: Прогрев
+        for i in range(min(warmup, len(self.clauses))):
+            clause_bdd = self._clause_to_bdd(self.clauses[i])
+            current_bdd &= clause_bdd
             
-            # Новые переменные этого уровня
-            new_vars = set(level['P']) - set(next_level['P'])
-            if not new_vars and not level['Q']:
-                continue
+            if i % 5 == 0 or i == warmup-1:
+                self._print_stats(f"прогрев {i+1}/{warmup}")
+        
+        self._print_stats("прогрев завершен")
+        
+        # Принудительная сборка мусора
+        self.bdd.collect_garbage()
+        gc.collect()
+        
+        # Фаза 2: Основной цикл
+        print(f"\n🚀 Основной цикл с элиминацией...")
+        
+        # Для долгожителей используем динамический порог элиминации
+        elimination_threshold = 5 if problem_type == "long_lived_dominant" else 1
+        
+        for i in range(warmup, len(self.clauses)):
+            clause = self.clauses[i]
             
-            # 🔥 ЛОКАЛЬНЫЙ КОНТЕЙНЕР
-            local_manager = BDD()
-            local = local_manager.true
-            all_vars_here = set(level['P']) | set(level['Q'])
-            for v in all_vars_here:
-                local_manager.declare(f'x{v}')
+            # Добавляем клоз
+            clause_bdd = self._clause_to_bdd(clause)
+            current_bdd &= clause_bdd
             
-            # Строим локальный BDD для этого уровня
-            level_clauses = self._get_clauses_for(all_vars_here)
-            for c in level_clauses:
-                local &= self._clause_to_bdd(local_manager, c)
+            # Проверяем переменные на элиминацию
+            vars_to_eliminate = set()
+            for var in range(1, self.n + 1):
+                if var in eliminated_vars:
+                    continue
+                if self.last_seen.get(var, -1) == i:
+                    vars_to_eliminate.add(var)
             
-            # ТОТАЛЬНАЯ ЗАЧИСТКА
-            vars_to_keep = set(next_level['P'])
-            vars_to_kill = all_vars_here - vars_to_keep
+            if vars_to_eliminate and len(vars_to_eliminate) >= elimination_threshold:
+                # Элиминируем
+                var_names = {f'x{var}' for var in vars_to_eliminate}
+                current_bdd = self.bdd.exist(var_names, current_bdd)
+                eliminated_vars.update(vars_to_eliminate)
+                
+                # Периодическая статистика
+                if len(eliminated_vars) % 10 == 0:
+                    self.bdd.collect_garbage()
+                    self._print_stats(f"клоз {i+1}/{len(self.clauses)}, элиминировано {len(eliminated_vars)} пер.")
             
-            if vars_to_kill:
-                kill_set = {f'x{v}' for v in vars_to_kill}
-                local = local_manager.exist(kill_set, local)
-                local_manager.collect_garbage()
-            
-            # Перенос в основной BDD
-            # Добавляем недостающие переменные
-            for v in vars_to_keep:
-                if f'x{v}' not in self.manager.vars:
-                    self.manager.declare(f'x{v}')
-            
-            # Конъюнкция с локальным результатом
-            # Это костыль - в идеале нужно копирование BDD между менеджерами
-            # Но для теста сойдет
-            temp = self.manager.true
-            for assign in local_manager.pick_iter(local):
-                # Строим BDD для этого присваивания
-                assign_bdd = self.manager.true
-                for var, val in assign.items():
-                    if var.startswith('x'):
-                        var_bdd = self.manager.var(var) if val else ~self.manager.var(var)
-                        assign_bdd &= var_bdd
-                temp &= assign_bdd
-            
-            self.main_bdd &= temp
-            
-            self._print_stats(f"уровень {i}")
-            
-            if self.main_bdd == self.manager.false:
-                print("  ❌ UNSAT")
+            # Проверка на UNSAT
+            if current_bdd == self.bdd.false:
+                print(f"  ❌ UNSAT на клозе {i+1}")
                 return False
             
-            gc.collect()
+            # Периодическая сборка мусора
+            if i % 50 == 0:
+                gc.collect()
         
-        # Финал
-        if self.main_bdd == self.main_bdd.false:
+        # Финальная проверка
+        self._print_stats("финал")
+        
+        if current_bdd == self.bdd.false:
             return False
-        if self.main_bdd == self.main_bdd.true:
+        if current_bdd == self.bdd.true:
             return True
+        
+        # Ищем модель
         try:
-            next(self.main_bdd.pick_iter(self.main_bdd))
+            next(current_bdd.pick_iter(current_bdd))
             return True
         except StopIteration:
             return False
+        finally:
+            current, peak = tracemalloc.get_traced_memory()
+            print(f"\n💾 Пик памяти: {peak/1024/1024:.1f} MB")
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
-        print("Использование: python matryoshka_lite.py <file.cnf>")
+        print("Использование: python matryoshka_solver_3.py <file.cnf>")
         sys.exit(1)
     
     filename = sys.argv[1]
@@ -209,6 +277,4 @@ if __name__ == "__main__":
     
     print(f"\n{'='*70}")
     print(f"🎯 РЕЗУЛЬТАТ: {'SAT' if result else 'UNSAT'}")
-    current, peak = tracemalloc.get_traced_memory()
-    print(f"💾 Пик памяти: {peak/1024/1024:.1f} MB")
     tracemalloc.stop()
