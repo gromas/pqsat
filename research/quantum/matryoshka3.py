@@ -108,17 +108,18 @@ class MatryoshkaLite:
         self._build_plan()
         
         # Основной BDD - только для самого глубокого уровня
-        self.main_bdd = BDD()
+        self.manager = BDD()
         bottom_vars = self.levels[0]['P']
         if not bottom_vars:
             bottom_vars = self.levels[0]['Q']
         for v in bottom_vars:
-            self.main_bdd.declare(f'x{v}')
+            self.manager.declare(f'x{v}')
+        self.main_bdd = self.manager.true
         
         # Строим дно
         bottom_clauses = self._get_clauses_for(bottom_vars)
         for c in bottom_clauses:
-            self.main_bdd &= self._clause_to_bdd(self.main_bdd, c)
+            self.main_bdd &= self._clause_to_bdd(self.manager, c)
         self._print_stats("дно")
         
         # Поднимаемся по уровням
@@ -132,42 +133,42 @@ class MatryoshkaLite:
                 continue
             
             # 🔥 ЛОКАЛЬНЫЙ КОНТЕЙНЕР
-            local = BDD()
+            local_manager = BDD()
+            local = local_manager.true
             all_vars_here = set(level['P']) | set(level['Q'])
             for v in all_vars_here:
-                local.declare(f'x{v}')
+                local_manager.declare(f'x{v}')
             
             # Строим локальный BDD для этого уровня
             level_clauses = self._get_clauses_for(all_vars_here)
             for c in level_clauses:
-                local &= self._clause_to_bdd(local, c)
+                local &= self._clause_to_bdd(local_manager, c)
             
             # ТОТАЛЬНАЯ ЗАЧИСТКА
             vars_to_keep = set(next_level['P'])
             vars_to_kill = all_vars_here - vars_to_keep
             
             if vars_to_kill:
-                kill_names = tuple(f'x{v}' for v in vars_to_kill)  # ← ИСПРАВЛЕНО!
-                local = local.exist(kill_names)
-                    
-                local.collect_garbage()
+                kill_set = {f'x{v}' for v in vars_to_kill}
+                local = local_manager.exist(kill_set, local)
+                local_manager.collect_garbage()
             
             # Перенос в основной BDD
             # Добавляем недостающие переменные
             for v in vars_to_keep:
-                if f'x{v}' not in self.main_bdd.vars:
-                    self.main_bdd.declare(f'x{v}')
+                if f'x{v}' not in self.manager.vars:
+                    self.manager.declare(f'x{v}')
             
             # Конъюнкция с локальным результатом
             # Это костыль - в идеале нужно копирование BDD между менеджерами
             # Но для теста сойдет
-            temp = self.main_bdd.true
-            for assign in local.pick_iter(local):
+            temp = self.manager.true
+            for assign in local_manager.pick_iter(local):
                 # Строим BDD для этого присваивания
-                assign_bdd = self.main_bdd.true
+                assign_bdd = self.manager.true
                 for var, val in assign.items():
                     if var.startswith('x'):
-                        var_bdd = self.main_bdd.var(var) if val else ~self.main_bdd.var(var)
+                        var_bdd = self.manager.var(var) if val else ~self.manager.var(var)
                         assign_bdd &= var_bdd
                 temp &= assign_bdd
             
@@ -175,7 +176,7 @@ class MatryoshkaLite:
             
             self._print_stats(f"уровень {i}")
             
-            if self.main_bdd == self.main_bdd.false:
+            if self.main_bdd == self.manager.false:
                 print("  ❌ UNSAT")
                 return False
             
