@@ -7,16 +7,17 @@ import tracemalloc
 from collections import defaultdict, Counter
 from dimacs_loader import parse_dimacs_cnf
 
-class MatryoshkaStreamV3:
+class MatryoshkaHybridV3:
     def __init__(self):
         self.bdd = None
         self.clauses = []
         self.n = 0
-        self.last_seen = {}  # Карта последнего вхождения переменной
-        self.first_seen = {}  # Карта первого вхождения
-        self.var_lifetime = {}  # Длительность жизни
-        self.var_frequency = Counter()  # Частота появления
-        self.elimination_order = []  # Порядок элиминации переменных
+        self.levels = []
+        self.last_seen = {}
+        self.first_seen = {}
+        self.var_lifetime = {}
+        self.var_to_level = {}
+        self.all_vars_declared = set()
         self.peak_memory = 0
         self.peak_nodes = 0
         self.start_time = None
@@ -29,106 +30,165 @@ class MatryoshkaStreamV3:
         elapsed = time.time() - self.start_time
         print(f"  ⏱️ {elapsed:.1f}s | 💾 {current/1024/1024:.1f} MB | 📊 {len(self.bdd) if self.bdd else 0:,} узлов | {label}")
     
-    def _build_dependency_map(self):
-        """Строит карты первого и последнего вхождения для каждой переменной"""
-        self.first_seen = {}
-        self.last_seen = {}
-        self.var_frequency = Counter()
+    def _find_vertex_cover_for_subset(self, var_subset):
+        """Жадное вершинное покрытие для подмножества переменных"""
+        if len(var_subset) <= 1:
+            return [], list(var_subset)
         
+        var_set = set(var_subset)
+        edges = set()
+        
+        for clause in self.clauses:
+            vars_in_clause = [abs(lit) for lit in clause if abs(lit) in var_set]
+            if len(vars_in_clause) < 2:
+                continue
+            for i in range(len(vars_in_clause)):
+                for j in range(i+1, len(vars_in_clause)):
+                    a, b = sorted([vars_in_clause[i], vars_in_clause[j]])
+                    edges.add((a, b))
+        
+        if not edges:
+            return [], list(var_subset)
+        
+        degree = defaultdict(int)
+        for a, b in edges:
+            degree[a] += 1
+            degree[b] += 1
+        
+        cover = set()
+        uncovered = edges.copy()
+        
+        while uncovered and degree:
+            max_vertex = max(degree.items(), key=lambda x: x[1])[0]
+            cover.add(max_vertex)
+            
+            to_remove = []
+            for edge in uncovered:
+                if max_vertex in edge:
+                    to_remove.append(edge)
+                    a, b = edge
+                    if a in degree:
+                        degree[a] -= 1
+                        if degree[a] == 0:
+                            del degree[a]
+                    if b in degree:
+                        degree[b] -= 1
+                        if degree[b] == 0:
+                            del degree[b]
+            for edge in to_remove:
+                uncovered.remove(edge)
+        
+        P = list(cover)
+        Q = [v for v in var_subset if v not in cover]
+        return P, Q
+    
+    def _build_matryoshka_with_lifetime(self):
+        """Строит матрешку с учетом времени жизни переменных"""
+        print("\n🏗️ Построение гибридной матрешки...")
+        
+        # Строим карту last_seen
+        self.last_seen = {}
+        self.first_seen = {}
         for i, clause in enumerate(self.clauses):
             for lit in clause:
                 var = abs(lit)
-                self.var_frequency[var] += 1
                 if var not in self.first_seen:
                     self.first_seen[var] = i
                 self.last_seen[var] = i
         
-        # Вычисляем длительность жизни
+        # Вычисляем время жизни
         self.var_lifetime = {}
         for var in self.first_seen:
             self.var_lifetime[var] = self.last_seen[var] - self.first_seen[var]
         
-        # Анализируем статистику
-        short_lived = [v for v, lt in self.var_lifetime.items() if lt < 20]
-        medium_lived = [v for v, lt in self.var_lifetime.items() if 20 <= lt <= 100]
-        long_lived = [v for v, lt in self.var_lifetime.items() if lt > 100]
+        # Все переменные задачи
+        all_vars = list(range(1, self.n + 1))
         
-        print(f"  📊 Короткоживущие (<20 клозов): {len(short_lived)}")
-        print(f"  📊 Среднеживущие (20-100): {len(medium_lived)}")
-        print(f"  📊 Долгоживущие (>100 клозов): {len(long_lived)}")
+        # Разделяем переменные на "долгожителей" и "короткожителей"
+        lifetime_threshold = len(self.clauses) * 0.3
+        long_lived = [v for v in all_vars if self.var_lifetime.get(v, 0) > lifetime_threshold]
+        short_lived = [v for v in all_vars if self.var_lifetime.get(v, 0) <= lifetime_threshold]
         
-        # Строим порядок элиминации
-        self.elimination_order = sorted(
-            [(var, self.last_seen[var]) for var in range(1, self.n + 1) if var in self.last_seen],
-            key=lambda x: x[1]  # Сортируем по времени последнего появления
-        )
+        print(f"  📊 Долгожители (>30% задачи): {len(long_lived)}")
+        print(f"  📊 Короткожители: {len(short_lived)}")
         
-        print(f"  📊 Первая переменная для элиминации: x{self.elimination_order[0][0]} на клозе {self.elimination_order[0][1]}")
-        print(f"  📊 Последняя переменная для элиминации: x{self.elimination_order[-1][0]} на клозе {self.elimination_order[-1][1]}")
+        # Строим иерархию для долгожителей
+        levels = []
+        current_vars = long_lived
+        depth = 0
         
-        # Определяем тип задачи
-        if len(long_lived) > self.n * 0.3:
-            return "long_lived_dominant"
-        return "normal"
+        while current_vars and depth < 10:
+            P, Q_level = self._find_vertex_cover_for_subset(current_vars)
+            
+            if not P:
+                levels.append({
+                    'level': depth,
+                    'P': [],
+                    'Q': current_vars,
+                    'type': 'bottom'
+                })
+                break
+            
+            # Для каждой переменной в Q запоминаем уровень элиминации
+            for var in Q_level:
+                self.var_to_level[var] = depth
+            
+            levels.append({
+                'level': depth,
+                'P': P,
+                'Q': Q_level,
+                'type': 'hierarchical'
+            })
+            
+            print(f"  Уровень {depth}: |P|={len(P)}, |Q|={len(Q_level)}")
+            current_vars = P
+            depth += 1
+        
+        # Добавляем короткожителей
+        if short_lived:
+            for var in short_lived:
+                self.var_to_level[var] = depth
+            levels.append({
+                'level': depth,
+                'P': [],
+                'Q': short_lived,
+                'type': 'streaming'
+            })
+            print(f"  Уровень {depth} (потоковый): |Q|={len(short_lived)}")
+        
+        self.levels = levels
+        return levels
     
-    def _min_fill_ordering(self):
-        """Min-fill эвристика для сортировки клозов"""
-        print("\n🔄 Применяем Min-fill эвристику...")
-        
-        # Создаем граф переменных
-        var_graph = defaultdict(set)
-        for clause in self.clauses:
-            vars_in = [abs(lit) for lit in clause]
-            for i in range(len(vars_in)):
-                for j in range(i+1, len(vars_in)):
-                    var_graph[vars_in[i]].add(vars_in[j])
-                    var_graph[vars_in[j]].add(vars_in[i])
-        
-        # Оцениваем каждый клоз
-        clause_scores = []
-        for i, clause in enumerate(self.clauses):
-            vars_in = [abs(lit) for lit in clause]
-            
-            # Метрика 1: fill - сколько новых связей создаст этот клоз
-            fill = 0
-            for j, v1 in enumerate(vars_in):
-                for v2 in vars_in[j+1:]:
-                    if v2 not in var_graph[v1]:
-                        fill += 1
-            
-            # Метрика 2: близость к элиминации
-            elimination_proximity = min(self.last_seen[v] - i for v in vars_in)
-            
-            # Метрика 3: разнообразие переменных
-            diversity = len(set(vars_in))
-            
-            # Итоговая оценка (чем меньше, тем лучше)
-            score = fill * 10 - elimination_proximity * 5 - diversity * 3
-            clause_scores.append((score, i, clause))
-        
-        # Сортируем
-        clause_scores.sort()
-        sorted_clauses = [clause for _, _, clause in clause_scores]
-        
-        print(f"  ✅ Первые 5 клозов после сортировки:")
-        for i in range(min(5, len(sorted_clauses))):
-            vars_in = [abs(lit) for lit in sorted_clauses[i]]
-            lifetimes = [self.var_lifetime[v] for v in vars_in]
-            elim_times = [self.last_seen[v] for v in vars_in]
-            print(f"    Клоз {i}: vars={vars_in}, elim={elim_times}")
-        
-        return sorted_clauses
+    def _declare_var_safe(self, var):
+        """Безопасно объявляет переменную в BDD"""
+        name = f'x{var}'
+        if name not in self.all_vars_declared:
+            if name not in self.bdd.vars:
+                self.bdd.declare(name)
+            self.all_vars_declared.add(name)
     
     def _clause_to_bdd(self, clause):
         """Превращает клоз в BDD"""
         clause_bdd = self.bdd.false
         for lit in clause:
-            var_name = f'x{abs(lit)}'
-            if var_name not in self.bdd.vars:
-                self.bdd.declare(var_name)
-            lit_bdd = self.bdd.var(var_name) if lit > 0 else ~self.bdd.var(var_name)
+            var = abs(lit)
+            name = f'x{var}'
+            # Убеждаемся, что переменная объявлена
+            if name not in self.all_vars_declared:
+                self._declare_var_safe(var)
+            lit_bdd = self.bdd.var(name) if lit > 0 else ~self.bdd.var(name)
             clause_bdd |= lit_bdd
         return clause_bdd
+    
+    def _get_clauses_for_vars(self, vars_set):
+        """Возвращает клозы, где все переменные в vars_set"""
+        result = []
+        vars_set = set(vars_set)
+        for clause in self.clauses:
+            clause_vars = set(abs(lit) for lit in clause)
+            if clause_vars.issubset(vars_set):
+                result.append(clause)
+        return result
     
     def solve(self, clauses, n):
         self.start_time = time.time()
@@ -136,81 +196,139 @@ class MatryoshkaStreamV3:
         self.n = n
         
         print(f"\n{'='*70}")
-        print(f"МАТРЕШКА STREAM V3")
+        print(f"МАТРЕШКА ГИБРИД V3 (2.0 + 3.0)")
         print(f"{'='*70}")
         print(f"📊 {n} переменных, {len(clauses)} клозов")
         
-        # Шаг 1: Строим карту зависимостей
-        problem_type = self._build_dependency_map()
-        self._print_stats("карта зависимостей")
+        # Шаг 1: Строим гибридную матрешку
+        levels = self._build_matryoshka_with_lifetime()
+        self._print_stats("матрешка построена")
         
-        # Шаг 2: Min-fill сортировка клозов
-        self.clauses = self._min_fill_ordering()
-        self._print_stats("после сортировки")
-        
-        # Перестраиваем last_seen с учетом новой сортировки
-        self.last_seen = {}
-        for i, clause in enumerate(self.clauses):
-            for lit in clause:
-                self.last_seen[abs(lit)] = i
-        
-        # Шаг 3: Инициализируем BDD
-        print("\n🚀 Инициализация BDD...")
+        # Шаг 2: Инициализируем BDD
         self.bdd = BDD()
+        self.all_vars_declared = set()
         
-        # Настраиваем реордеринг в зависимости от типа задачи
+        # Пытаемся настроить реордеринг
         try:
-            if problem_type == "long_lived_dominant":
-                # Для долгожителей нужен реордеринг
-                self.bdd.configure(reordering=True, max_memory=1024*1024*1024)
-                print("  ✅ Реордеринг ВКЛЮЧЕН (режим долгожителей)")
-            else:
-                # Для короткоживущих можно отключить
-                self.bdd.configure(reordering=False)
-                print("  ✅ Реордеринг ОТКЛЮЧЕН")
+            self.bdd.configure(reordering=True, max_memory=1024*1024*1024)
+            print("  ✅ Реордеринг ВКЛЮЧЕН")
         except:
             print("  ⚠️ Не удалось настроить реордеринг")
         
+        # Шаг 3: Проходим по уровням снизу вверх
+        print("\n🔄 Подъём по матрешке...")
+        
+        # Начинаем с самого глубокого уровня
+        bottom_level = levels[-1]
+        current_vars = set(bottom_level['P'] if bottom_level['P'] else bottom_level['Q'])
+        
+        # Объявляем все переменные нижнего уровня
+        print(f"\n🎯 Дно: {len(current_vars)} переменных")
+        for var in current_vars:
+            self._declare_var_safe(var)
+        
+        # Строим BDD для нижнего уровня
         current_bdd = self.bdd.true
-        eliminated_vars = set()
+        bottom_clauses = self._get_clauses_for_vars(current_vars)
+        for clause in bottom_clauses:
+            current_bdd &= self._clause_to_bdd(clause)
         
-        # Шаг 4: Потоковая обработка с ранней элиминацией
-        print(f"\n📦 Потоковая обработка {len(self.clauses)} клозов...")
+        self._print_stats(f"дно (ур.{len(levels)-1})")
         
-        for i, clause in enumerate(self.clauses):
-            # Добавляем текущий клоз
-            clause_bdd = self._clause_to_bdd(clause)
-            current_bdd &= clause_bdd
+        # Поднимаемся вверх
+        for level_idx in range(len(levels)-2, -1, -1):
+            level = levels[level_idx]
             
-            # Проверка на UNSAT
+            print(f"\n📦 Уровень {level_idx} (тип: {level.get('type', 'hierarchical')})")
+            
+            if level.get('type') != 'streaming':
+                # ИЕРАРХИЧЕСКИЙ УРОВЕНЬ
+                new_vars = set(level['P']) - current_vars
+                if new_vars:
+                    print(f"  ➕ Добавляем P: {len(new_vars)} переменных")
+                    for var in new_vars:
+                        self._declare_var_safe(var)
+                    
+                    # Добавляем все клозы этого уровня
+                    all_vars_here = set(level['P']) | set(level['Q'])
+                    level_clauses = self._get_clauses_for_vars(all_vars_here)
+                    
+                    # Фильтруем только новые клозы
+                    for clause in level_clauses:
+                        clause_vars = set(abs(lit) for lit in clause)
+                        # Добавляем только если есть переменные из нового уровня
+                        if clause_vars & new_vars:
+                            current_bdd &= self._clause_to_bdd(clause)
+                    
+                    current_vars = set(level['P'])  # Обновляем текущие переменные
+                
+                # Схлопываем Q (элиминируем)
+                if level['Q']:
+                    print(f"  🔄 Схлопываем Q: {len(level['Q'])} переменных")
+                    q_vars = [f'x{q}' for q in level['Q']]
+                    
+                    # ВАЖНО: Проверяем, что все переменные существуют
+                    existing_q_vars = [v for v in q_vars if v in self.all_vars_declared]
+                    if existing_q_vars:
+                        current_bdd = self.bdd.exist(existing_q_vars, current_bdd)
+                        
+                        # Удаляем из отслеживания
+                        for var in level['Q']:
+                            self.all_vars_declared.discard(f'x{var}')
+                        
+                        self.bdd.collect_garbage()
+            
+            else:
+                # ПОТОКОВЫЙ УРОВЕНЬ
+                print(f"  🌊 Потоковая обработка {len(level['Q'])} переменных")
+                
+                # Объявляем все переменные потокового уровня
+                for var in level['Q']:
+                    self._declare_var_safe(var)
+                
+                # Проходим по всем клозам
+                eliminated_here = set()
+                active_vars = set(level['Q'])
+                
+                for i, clause in enumerate(self.clauses):
+                    # Добавляем клоз, если он содержит активные переменные
+                    vars_in_clause = set(abs(lit) for lit in clause)
+                    relevant_vars = vars_in_clause & active_vars
+                    
+                    if relevant_vars:
+                        current_bdd &= self._clause_to_bdd(clause)
+                    
+                    # Ранняя элиминация
+                    for var in list(active_vars):
+                        if var in eliminated_here:
+                            continue
+                        if self.last_seen.get(var, -1) == i:
+                            # Элиминируем переменную
+                            current_bdd = self.bdd.exist({f'x{var}'}, current_bdd)
+                            eliminated_here.add(var)
+                            active_vars.remove(var)
+                            self.all_vars_declared.discard(f'x{var}')
+                            print(f"    ⚡ Ранняя элиминация x{var} на клозе {i}")
+                    
+                    # Периодическая сборка мусора
+                    if i % 100 == 0:
+                        self.bdd.collect_garbage()
+                    
+                    # Проверка на UNSAT
+                    if current_bdd == self.bdd.false:
+                        print(f"  ❌ UNSAT на клозе {i}")
+                        return False
+                
+                print(f"  ✅ Элиминировано {len(eliminated_here)} переменных")
+            
+            self._print_stats(f"после ур.{level_idx}")
+            
             if current_bdd == self.bdd.false:
-                print(f"\n  ❌ UNSAT на клозе {i+1}")
                 return False
             
-            # Ранняя элиминация: находим переменные, которые больше не встретятся
-            vars_to_eliminate = set()
-            for var in range(1, self.n + 1):
-                if var in eliminated_vars:
-                    continue
-                if self.last_seen.get(var, -1) == i:
-                    vars_to_eliminate.add(var)
-            
-            if vars_to_eliminate:
-                # Элиминируем все переменные сразу
-                var_names = {f'x{var}' for var in vars_to_eliminate}
-                current_bdd = self.bdd.exist(var_names, current_bdd)
-                eliminated_vars.update(vars_to_eliminate)
-                
-                # Статистика
-                if len(eliminated_vars) % 10 == 0:
-                    self._print_stats(f"клоз {i+1}/{len(self.clauses)} (элим. {len(eliminated_vars)})")
-                    self.bdd.collect_garbage()
-            
-            # Периодическая сборка мусора
-            if i % 100 == 0 and i > 0:
-                gc.collect()
+            gc.collect()
         
-        # Шаг 5: Финальная проверка
+        # Финальная проверка
         print("\n🔍 Финальная проверка...")
         self._print_stats("финал")
         
@@ -219,27 +337,24 @@ class MatryoshkaStreamV3:
         if current_bdd == self.bdd.true:
             return True
         
-        # Пытаемся найти решение
+        # ИСПРАВЛЕНО: Используем bdd.pick_iter(), а не current_bdd.pick_iter()
         try:
-            next(current_bdd.pick_iter(current_bdd))
+            next(self.bdd.pick_iter(current_bdd))
             return True
         except StopIteration:
             return False
         finally:
-            # Итоговая статистика
             elapsed = time.time() - self.start_time
             print(f"\n{'='*70}")
             print(f"📊 ИТОГОВАЯ СТАТИСТИКА")
             print(f"  ⏱️ Время: {elapsed:.1f}с")
             print(f"  💾 Пик памяти: {self.peak_memory/1024/1024:.1f} MB")
             print(f"  📊 Пик узлов BDD: {self.peak_nodes:,}")
-            print(f"  🔄 Элиминировано переменных: {len(eliminated_vars)}")
             tracemalloc.stop()
-
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
-        print("Использование: python matryoshka_stream_v3.py <file.cnf>")
+        print("Использование: python matryoshka_hybrid_v3.py <file.cnf>")
         sys.exit(1)
     
     filename = sys.argv[1]
@@ -248,7 +363,7 @@ if __name__ == "__main__":
         sys.exit(1)
     
     n, clauses = parse_dimacs_cnf(filename)
-    solver = MatryoshkaStreamV3()
+    solver = MatryoshkaHybridV3()
     result = solver.solve(clauses, n)
     
     print(f"\n{'='*70}")
