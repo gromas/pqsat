@@ -230,7 +230,7 @@ Repository Structure (Planned)
 ├── theory/                # Theoretical description
 │   ├── pq-split.md        # root of theory of pq-alghoritm
 │   ├── pq-to-bdd.md       # symbolic elimination description
-├── recursive_learning     # recursive lerning, based on BDD, ALL-SAT solver
+├── recursive_learning     # recursive lerning based, subexponential, BDD based, ALL-SAT solver
 │   ├── readme.md          # theory and description
 │   ├── matryoshka.py      # python implementation ALL-SAT alghoritm
 |   ├── dimacs_loader.py   # loader for dimasc files (.cnf)
