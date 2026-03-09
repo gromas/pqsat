@@ -1,74 +1,118 @@
-def solve_pnp_sat(clauses, variables):
+import sys
+import time
+
+def parse_dimacs(filename):
+    """Парсер DIMACS CNF файлов"""
+    clauses = []
+    variables = set()
+    with open(filename, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('c') or line.startswith('p'):
+                continue
+            # Читаем литералы до нуля
+            lits = [int(x) for x in line.split()[:-1]]
+            clauses.append(set(lits))
+            for l in lits:
+                variables.add(abs(l))
+    return clauses, sorted(list(variables))
+
+def solve_pnp_sat(clauses, var_list):
     """
-    clauses: список множеств (напр. [{"a", "b", "c"}, {"-a", "d"}])
-    variables: упорядоченный список переменных ["x1", "x2", ..., "xn"]
+    Реализация алгоритма PNP (п. 4):
+    Прямой ход: элиминация переменных (удаление литералов).
+    Обратный ход: вычисление через кофактор A.
     """
-    f_history = []  # Храним состояние кофакторов для обратного хода
+    f_history = []
     current_clauses = [set(c) for c in clauses]
 
-    # ПРЯМОЙ ХОД: Алгебраическая элиминация (Пункт 4)
-    for x in variables:
-        not_x = "-" + x if not x.startswith("-") else x[1:]
+    # --- ПРЯМОЙ ХОД (Синтез функций) ---
+    for x in var_list:
+        not_x = -x
         
-        # Разделяем формулу на части A (с x), B (с not_x) и R (остальное)
+        # A: клозы с x, B: клозы с -x, R: остальные
         A = [c for c in current_clauses if x in c]
         B = [c for c in current_clauses if not_x in c]
         R = [c for c in current_clauses if x not in c and not_x not in c]
         
-        # Сохраняем "проекцию" для обратного хода
-        # f(x) зависит от того, что осталось в A и R
-        f_history.append((x, not_x, list(A), list(R)))
+        # Сохраняем кофактор A для обратного хода
+        # Важно: сохраняем A БЕЗ самого x, так как мы проверяем остаток клоза
+        f_history.append((x, [c - {x} for c in A]))
         
-        # КОЛЛАПС: F' = (A \ {x}) + (B \ {not_x}) + R
-        # Это "бесплатная" редукция без раздувания
+        # КОЛЛАПС (п. 4): F' = (A \ {x}) + (B \ {-x}) + R
+        # Сложность формулы (кол-во литералов) только уменьшается
         new_A = [c - {x} for c in A]
         new_B = [c - {not_x} for c in B]
         current_clauses = new_A + new_B + R
 
-    # ОБРАТНЫЙ ХОД: Сборка вектора
-    values = {}
-    # Идем от x_n к x_1
-    for x, not_x, A_orig, R_orig in reversed(f_history):
-        # Вычисляем f(x) = A * R на уже известных значениях
-        # Если хотя бы один клоз в A или R занулился -> бит x = 0
-        # Иначе пробуем x = 1 (максимизация)
+    # --- ОБРАТНЫЙ ХОД (Вычисление вектора) ---
+    values = {} # {var_id: True/False}
+    
+    for x, A_stripped in reversed(f_history):
+        # x_i = 1, если f(x_i) = 1.
+        # f(x_i) — это значение кофактора A на уже известных x_{i+1}...x_n
         
-        def check_satisfied(clauses_list, current_values):
-            for c in clauses_list:
-                # Если в клозе нет ни одного True литерала — он потенциально 0
-                resolved = False
-                for lit in c:
-                    v = lit.strip("-")
-                    val = current_values.get(v)
-                    if val is not None:
-                        is_neg = lit.startswith("-")
-                        if (val and not is_neg) or (not val and is_neg):
-                            resolved = True; break
-                if not resolved and all(l.strip("-") in current_values for l in c):
-                    return False # Клоз точно 0
-            return True
-
-        # Пробуем положить x = 1
-        if check_satisfied(A_orig + R_orig, {**values, x: True}):
-            values[x] = True
-        else:
-            values[x] = False
-
-    # ФИНАЛЬНАЯ ВЕРИФИКАЦИЯ
-    is_valid = True
-    for c in clauses:
-        clause_sat = False
-        for lit in c:
-            v = lit.strip("-")
-            val = values[v]
-            if (val and not lit.startswith("-")) or (not val and lit.startswith("-")):
-                clause_sat = True; break
-        if not clause_sat:
-            is_valid = False; break
+        is_f_true = True
+        for clause in A_stripped:
+            # Если в клозе уже есть хотя бы один True литерал — клоз удовлетворен.
+            # Если в клозе все определенные литералы False — клоз 0.
+            clause_satisfied = False
+            for lit in clause:
+                v_id = abs(lit)
+                if v_id in values:
+                    val = values[v_id]
+                    # Литерал истинен, если (положительный и True) или (отрицательный и False)
+                    if (lit > 0 and val) or (lit < 0 and not val):
+                        clause_satisfied = True
+                        break
             
-    return values, is_valid
+            # Если хоть один клоз в кофакторе точно "упал" в 0, f(x_i) становится 0
+            # (Здесь мы считаем, что неопределенные переменные — это потенциальные 1)
+            if not clause_satisfied and all(abs(l) in values for l in clause):
+                is_f_true = False
+                break
+        
+        # Присваиваем значение x_i
+        values[x] = is_f_true
 
-# Пример использования:
-# vars = ["a", "b"]
-# cls = [{"a", "b"}, {"-a", "b"}]
-# result, sat = solve_pnp_sat(cls, vars)
+    return values
+
+def verify(clauses, values):
+    """Финальная проверка решения"""
+    for c in clauses:
+        satisfied = False
+        for lit in c:
+            v_id = abs(lit)
+            val = values.get(v_id)
+            if (lit > 0 and val) or (lit < 0 and not val):
+                satisfied = True
+                break
+        if not satisfied:
+            return False
+    return True
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python pnp_solver.py <file.cnf>")
+        sys.exit(1)
+
+    file_path = sys.argv[1]
+    clauses, var_list = parse_dimacs(file_path)
+    
+    print(f"--- Запуск PNP SAT Solver ---")
+    print(f"Файл: {file_path}")
+    print(f"Переменных: {len(var_list)}, Клозов: {len(clauses)}")
+    
+    start_time = time.time()
+    solution = solve_pnp_sat(clauses, var_list)
+    end_time = time.time()
+    
+    is_sat = verify(clauses, solution)
+    
+    print(f"\nРезультат: {'SAT' if is_sat else 'UNSAT (или решение не найдено)'}")
+    print(f"Время вычисления: {end_time - start_time:.4f} сек.")
+    
+    if is_sat:
+        # Вывод первых 10 значений для примера
+        sample = {k: solution[k] for k in list(solution)[:10]}
+        print(f"Пример вектора: {sample}...")
