@@ -16,6 +16,59 @@ def parse_dimacs(filename):
             for l in lits:
                 variables.add(abs(l))
     return clauses, sorted(list(variables))
+    
+def solve_pnp_sat_strict(clauses, var_list):
+    f_history = []
+    current_clauses = [set(c) for c in clauses]
+
+    # --- ПРЯМОЙ ХОД: F' = A * R (Коллапс по п. 4) ---
+    for x in var_list:
+        not_x = -x
+        
+        # A: клозы с x, B: клозы с -x, R: остальные
+        A = [c for c in current_clauses if x in c]
+        B = [c for c in current_clauses if not_x in c]
+        R = [c for c in current_clauses if x not in c and not_x not in c]
+        
+        # Функция саморедукции f(x) = A v B
+        # Сохраняем и A, и B для обратного хода (как части одной функции)
+        A_stripped = [c - {x} for c in A]
+        B_stripped = [c - {not_x} for c in B]
+        f_history.append((x, A_stripped, B_stripped))
+        
+        # РЕДУКЦИЯ: B полностью элиминируется. Остается только A и R.
+        # Это предотвращает рост формулы.
+        current_clauses = A_stripped + R
+
+    # --- ОБРАТНЫЙ ХОД: x_i = f(x_{i+1}...x_n) = (A v B) ---
+    values = {}
+    for x, A_s, B_s in reversed(f_history):
+        # Проверяем f(x) = (A v B) на уже известных переменных справа
+        # Если хотя бы один клоз в A И хотя бы один в B "упали" в 0, 
+        # значит f(x) = 0. Иначе x = 1 (максимизация).
+        
+        def is_part_satisfied(part):
+            for clause in part:
+                if not clause: return False # Пустой клоз — это 0
+                sat = False
+                for lit in clause:
+                    v_id = abs(lit)
+                    if v_id in values:
+                        val = values[v_id]
+                        if (lit > 0 and val) or (lit < 0 and not val):
+                            sat = True; break
+                # Если клоз полностью определен и в нем нет True — он 0
+                if not sat and all(abs(l) in values for l in clause):
+                    return False
+            return True
+
+        # f(x) = A v B. Если оба кофактора противоречивы — x = 0.
+        if is_part_satisfied(A_s) or is_part_satisfied(B_s):
+            values[x] = True
+        else:
+            values[x] = False
+
+    return values
 
 def solve_pnp_sat(clauses, var_list):
     """
